@@ -5,6 +5,8 @@ import json
 import threading
 from datetime import datetime, timezone
 
+from cryptography import x509
+
 from . import certutils, coverage, db
 
 
@@ -82,6 +84,7 @@ def _plan_dict(row) -> dict:
         "eval_start": row["eval_start"],
         "eval_end": row["eval_end"],
         "trust_root_version": row["trust_root_version"],
+        "crl_snapshot_version": row["crl_snapshot_version"],
         "status": row["status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
@@ -93,6 +96,7 @@ def _approval_dict(row) -> dict:
         "id": row["id"],
         "plan_id": row["plan_id"],
         "trust_root_version": row["trust_root_version"],
+        "crl_snapshot_version": row["crl_snapshot_version"],
         "cert_fingerprints": json.loads(row["cert_fingerprints"]),
         "verdict": json.loads(row["verdict_json"]),
         "superseded": bool(row["superseded"]),
@@ -206,6 +210,145 @@ def _active_version(conn) -> str | None:
         "SELECT version FROM trust_roots WHERE is_active = 1 ORDER BY id LIMIT 1"
     ).fetchone()
     return row["version"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# CRL 撤销快照（不可变，按版本导入）
+# ---------------------------------------------------------------------------
+
+def _known_ca_certs(conn) -> list:
+    """全部已知 CA 候选：所有信任根版本的根证书 + 已导入证书链中的 CA 证书。"""
+    certs, seen = [], set()
+    rows = conn.execute("SELECT pem FROM trust_roots").fetchall()
+    rows += conn.execute("SELECT chain_pem AS pem FROM certificates").fetchall()
+    for row in rows:
+        for cert in certutils.parse_pem_chain(row["pem"]):
+            fp = certutils.fingerprint_sha256(cert)
+            if fp not in seen and _is_ca(cert):
+                seen.add(fp)
+                certs.append(cert)
+    return certs
+
+
+def _is_ca(cert) -> bool:
+    try:
+        ext = cert.extensions.get_extension_for_class(x509.BasicConstraints)
+    except x509.ExtensionNotFound:
+        return False
+    return bool(ext.value.ca)
+
+
+def _validate_snapshot_crls(crls, known_cas) -> None:
+    """导入期校验：同一签发者冲突、签名可验证、有效期区间完整。"""
+    seen_issuers: set[str] = set()
+    for crl in crls:
+        issuer = crl.issuer.rfc4514_string()
+        if issuer in seen_issuers:
+            raise ApiError(
+                409,
+                f"conflicting CRLs for issuer '{issuer}' in the same snapshot",
+            )
+        seen_issuers.add(issuer)
+        candidates = [c for c in known_cas if c.subject == crl.issuer]
+        if not candidates:
+            raise ApiError(
+                400,
+                f"CRL issuer '{issuer}' is not a known CA; import the issuing"
+                " CA certificate (trust root or chain) before the CRL snapshot",
+            )
+        if not any(certutils.verify_crl_signature(crl, c) for c in candidates):
+            raise ApiError(
+                400, f"CRL issued by '{issuer}' failed signature verification"
+            )
+        this_update, next_update = crl.last_update_utc, crl.next_update_utc
+        if next_update is None:
+            raise ApiError(
+                400,
+                f"CRL issued by '{issuer}' has no nextUpdate; offline snapshots"
+                " require a bounded validity interval",
+            )
+        if this_update >= next_update:
+            raise ApiError(
+                400,
+                f"CRL issued by '{issuer}' has thisUpdate {iso_z(this_update)}"
+                f" not before nextUpdate {iso_z(next_update)}",
+            )
+
+
+def import_crl_snapshot(version: str, pem: str) -> dict:
+    try:
+        crls = certutils.parse_pem_crls(pem)
+    except certutils.PemParseError as exc:
+        raise ApiError(400, f"invalid CRL snapshot PEM payload: {exc}") from exc
+    ts = iso_z(now_utc())
+    with _write_lock, db.connect() as conn:
+        if conn.execute(
+            "SELECT 1 FROM crl_snapshots WHERE version = ?", (version,)
+        ).fetchone():
+            raise ApiError(409, f"CRL snapshot version '{version}' already exists")
+        _validate_snapshot_crls(crls, _known_ca_certs(conn))
+        conn.execute(
+            "INSERT INTO crl_snapshots (version, pem, crl_count, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (version, pem, len(crls), ts),
+        )
+    return {
+        "version": version,
+        "crl_count": len(crls),
+        "issuers": sorted({c.issuer.rfc4514_string() for c in crls}),
+        "created_at": ts,
+    }
+
+
+def _crl_entry_dict(crl) -> dict:
+    return {
+        "issuer": crl.issuer.rfc4514_string(),
+        "this_update": iso_z(crl.last_update_utc),
+        "next_update": iso_z(crl.next_update_utc),
+        "revoked_count": len(crl),
+    }
+
+
+def list_crl_snapshots() -> list[dict]:
+    with db.connect() as conn:
+        rows = conn.execute("SELECT * FROM crl_snapshots ORDER BY id").fetchall()
+    return [
+        {
+            "version": r["version"],
+            "crl_count": r["crl_count"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
+def get_crl_snapshot(version: str) -> dict:
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM crl_snapshots WHERE version = ?", (version,)
+        ).fetchone()
+    if row is None:
+        raise ApiError(404, f"unknown CRL snapshot version '{version}'")
+    crls = certutils.parse_pem_crls(row["pem"])
+    return {
+        "version": row["version"],
+        "crl_count": row["crl_count"],
+        "created_at": row["created_at"],
+        "entries": [_crl_entry_dict(c) for c in crls],
+    }
+
+
+def _load_snapshot_crls(conn, version: str) -> dict[str, object]:
+    """加载快照并按签发者名称索引（导入时已保证每个签发者至多一条）。"""
+    row = conn.execute(
+        "SELECT * FROM crl_snapshots WHERE version = ?", (version,)
+    ).fetchone()
+    if row is None:
+        raise ApiError(404, f"unknown CRL snapshot version '{version}'")
+    return {
+        crl.issuer.rfc4514_string(): crl
+        for crl in certutils.parse_pem_crls(row["pem"])
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -339,16 +482,21 @@ def delete_window(window_id: int) -> dict:
 # 评估
 # ---------------------------------------------------------------------------
 
-def _assess_window(window, cert_row, roots, domain, eval_start, eval_end):
+def _assess_window(window, cert_row, roots, domain, eval_start, eval_end,
+                   crls=None, snapshot_version=None):
     """评估单个服务窗口：返回 (报告, 可用区间列表)。
 
     可用区间 = 窗口 ∩ 评估区间 ∩ 证书链有效期，且证书须通过全部 X.509 校验。
+    选择 CRL 快照时，还须为链上每张非根证书找到其签发者签署的 CRL，
+    可用区间再与撤销可用段 [thisUpdate, min(nextUpdate, 撤销生效时刻)) 求交；
+    缺失或验签失败的 CRL 使该窗口完全不可用。
     """
     w_start = max(parse_ts(window["start_utc"]), eval_start)
     w_end = min(parse_ts(window["end_utc"]), eval_end)
     reasons: list[str] = []
     intervals: list[tuple[datetime, datetime]] = []
     sans: list[str] = json.loads(cert_row["san_dns"]) if cert_row else []
+    crl_checks: list[dict] = []
 
     if cert_row is None:
         reasons.append(
@@ -378,6 +526,11 @@ def _assess_window(window, cert_row, roots, domain, eval_start, eval_end):
             else:
                 nb, na = certutils.chain_validity_interval(chain)
                 s, e = max(w_start, nb), min(w_end, na)
+                if crls is not None:
+                    s, e = _apply_crl_constraints(
+                        chain, crls, snapshot_version, w_start, w_end, s, e,
+                        reasons, crl_checks,
+                    )
                 if s < e:
                     intervals.append((s, e))
                 if nb > w_start:
@@ -407,16 +560,86 @@ def _assess_window(window, cert_row, roots, domain, eval_start, eval_end):
         ],
         "reasons": reasons,
     }
+    if crls is not None:
+        report["crl_checks"] = crl_checks
     return report, intervals
 
 
-def _evaluate(conn, plan_id, domain, eval_start, eval_end, version) -> dict:
+def _apply_crl_constraints(chain, crls, snapshot_version, w_start, w_end,
+                           s, e, reasons, crl_checks):
+    """对链上每张非根证书应用 CRL 约束，返回收紧后的可用区间 (s, e)。
+
+    任一非根证书缺失 CRL 或 CRL 验签失败 → 撤销证据不完整，窗口完全不可用。
+    否则可用区间与每条 CRL 的 [thisUpdate, min(nextUpdate, 撤销生效时刻)) 求交。
+    """
+    for idx, cert in enumerate(chain[:-1]):
+        issuer_cert = chain[idx + 1]
+        issuer = issuer_cert.subject.rfc4514_string()
+        subject = cert.subject.rfc4514_string()
+        kind = "certificate" if idx == 0 else "CA certificate"
+        check = {"subject": subject, "issuer": issuer}
+        crl = crls.get(issuer)
+        if crl is None:
+            reasons.append(
+                f"no CRL issued by '{issuer}' found in CRL snapshot"
+                f" '{snapshot_version}' for {kind} '{subject}'"
+            )
+            check["error"] = "crl_missing"
+            crl_checks.append(check)
+            continue
+        check["this_update"] = iso_z(crl.last_update_utc)
+        check["next_update"] = iso_z(crl.next_update_utc)
+        if not certutils.verify_crl_signature(crl, issuer_cert):
+            reasons.append(
+                f"CRL issued by '{issuer}' for {kind} '{subject}' failed"
+                " signature verification against the chain issuer"
+            )
+            check["error"] = "crl_signature_invalid"
+            crl_checks.append(check)
+            continue
+        this_update, next_update = crl.last_update_utc, crl.next_update_utc
+        usable_end = next_update
+        revoked = crl.get_revoked_certificate_by_serial_number(cert.serial_number)
+        if revoked is not None:
+            rev_at = revoked.revocation_date_utc
+            check["revoked"] = True
+            check["revocation_date"] = iso_z(rev_at)
+            usable_end = min(usable_end, rev_at)
+            if rev_at < w_end:
+                reasons.append(
+                    f"{kind} '{subject}' revoked by '{issuer}'"
+                    f" effective {iso_z(rev_at)}"
+                )
+        else:
+            check["revoked"] = False
+        crl_checks.append(check)
+        if this_update > w_start:
+            reasons.append(
+                f"CRL issued by '{issuer}' not valid until {iso_z(this_update)},"
+                f" after window start {iso_z(w_start)}"
+            )
+        if next_update < w_end:
+            reasons.append(
+                f"CRL issued by '{issuer}' expired at {iso_z(next_update)},"
+                f" before window end {iso_z(w_end)}"
+            )
+        s, e = max(s, this_update), min(e, usable_end)
+    if any("error" in c for c in crl_checks):
+        return s, s  # 撤销证据不完整：不得判为可用
+    return s, e
+
+
+def _evaluate(conn, plan_id, domain, eval_start, eval_end, version,
+              snapshot_version=None) -> dict:
     root_row = conn.execute(
         "SELECT * FROM trust_roots WHERE version = ?", (version,)
     ).fetchone()
     if root_row is None:
         raise ApiError(404, f"unknown trust root version '{version}'")
     roots = certutils.parse_pem_chain(root_row["pem"])
+    crls = None
+    if snapshot_version is not None:
+        crls = _load_snapshot_crls(conn, snapshot_version)
     windows = conn.execute(
         "SELECT * FROM service_windows WHERE domain = ? ORDER BY start_utc, id",
         (domain,),
@@ -430,7 +653,8 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version) -> dict:
             (w["certificate_fingerprint"],),
         ).fetchone()
         report, intervals = _assess_window(
-            w, cert_row, roots, domain, eval_start, eval_end
+            w, cert_row, roots, domain, eval_start, eval_end,
+            crls=crls, snapshot_version=snapshot_version,
         )
         usable.extend(intervals)
         reports.append(report)
@@ -446,10 +670,13 @@ def _evaluate(conn, plan_id, domain, eval_start, eval_end, version) -> dict:
         "certificates": reports,
         "evaluated_at": iso_z(now_utc()),
     }
+    if snapshot_version is not None:
+        result["crl_snapshot_version"] = snapshot_version
     conn.execute(
-        "INSERT INTO evaluations (plan_id, trust_root_version, has_gaps, result_json,"
-        " created_at) VALUES (?, ?, ?, ?, ?)",
-        (plan_id, version, 1 if gaps else 0, json.dumps(result), iso_z(now_utc())),
+        "INSERT INTO evaluations (plan_id, trust_root_version, crl_snapshot_version,"
+        " has_gaps, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (plan_id, version, snapshot_version, 1 if gaps else 0,
+         json.dumps(result), iso_z(now_utc())),
     )
     conn.execute(
         "UPDATE plans SET updated_at = ? WHERE id = ?", (iso_z(now_utc()), plan_id)
@@ -473,6 +700,7 @@ def create_plan(
     eval_start: datetime,
     eval_end: datetime,
     trust_root_version: str | None,
+    crl_snapshot_version: str | None = None,
 ) -> dict:
     if eval_start >= eval_end:
         raise ApiError(
@@ -491,19 +719,32 @@ def create_plan(
             "SELECT 1 FROM trust_roots WHERE version = ?", (version,)
         ).fetchone():
             raise ApiError(404, f"unknown trust root version '{version}'")
+        if crl_snapshot_version is not None and not conn.execute(
+            "SELECT 1 FROM crl_snapshots WHERE version = ?", (crl_snapshot_version,)
+        ).fetchone():
+            raise ApiError(
+                404, f"unknown CRL snapshot version '{crl_snapshot_version}'"
+            )
         ts = iso_z(now_utc())
         cur = conn.execute(
             "INSERT INTO plans (domain, eval_start, eval_end, trust_root_version,"
-            " status, created_at, updated_at) VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-            (domain, iso_z(eval_start), iso_z(eval_end), version, ts, ts),
+            " crl_snapshot_version, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (domain, iso_z(eval_start), iso_z(eval_end), version,
+             crl_snapshot_version, ts, ts),
         )
         plan_id = cur.lastrowid
-        evaluation = _evaluate(conn, plan_id, domain, eval_start, eval_end, version)
+        evaluation = _evaluate(conn, plan_id, domain, eval_start, eval_end, version,
+                               crl_snapshot_version)
         plan = _get_plan(conn, plan_id)
     return {"plan": _plan_dict(plan), "evaluation": evaluation}
 
 
-def evaluate_plan(plan_id: int, trust_root_version: str | None) -> dict:
+def evaluate_plan(
+    plan_id: int,
+    trust_root_version: str | None,
+    crl_snapshot_version: str | None = None,
+) -> dict:
     with _write_lock, db.connect() as conn:
         plan = _get_plan(conn, plan_id)
         version = trust_root_version or plan["trust_root_version"]
@@ -516,6 +757,27 @@ def evaluate_plan(plan_id: int, trust_root_version: str | None) -> dict:
                 "UPDATE plans SET trust_root_version = ?, updated_at = ? WHERE id = ?",
                 (version, iso_z(now_utc()), plan_id),
             )
+        snapshot = plan["crl_snapshot_version"]
+        if crl_snapshot_version is not None and crl_snapshot_version != snapshot:
+            if not conn.execute(
+                "SELECT 1 FROM crl_snapshots WHERE version = ?",
+                (crl_snapshot_version,),
+            ).fetchone():
+                raise ApiError(
+                    404, f"unknown CRL snapshot version '{crl_snapshot_version}'"
+                )
+            # 切换快照属于判定依据变更：已批准计划先转待复核（历史批准置为被取代）
+            _mark_plans_pending_review(
+                conn,
+                "SELECT id FROM plans WHERE id = ? AND status = 'approved'",
+                (plan_id,),
+            )
+            conn.execute(
+                "UPDATE plans SET crl_snapshot_version = ?, updated_at = ?"
+                " WHERE id = ?",
+                (crl_snapshot_version, iso_z(now_utc()), plan_id),
+            )
+            snapshot = crl_snapshot_version
         result = _evaluate(
             conn,
             plan_id,
@@ -523,6 +785,7 @@ def evaluate_plan(plan_id: int, trust_root_version: str | None) -> dict:
             parse_ts(plan["eval_start"]),
             parse_ts(plan["eval_end"]),
             version,
+            snapshot,
         )
     result["plan_id"] = plan_id
     return result
@@ -559,9 +822,11 @@ def approve_plan(plan_id: int) -> dict:
         )
         ts = iso_z(now_utc())
         cur = conn.execute(
-            "INSERT INTO approvals (plan_id, trust_root_version, cert_fingerprints,"
-            " verdict_json, superseded, created_at) VALUES (?, ?, ?, ?, 0, ?)",
-            (plan_id, ev["trust_root_version"], json.dumps(fps), ev["result_json"], ts),
+            "INSERT INTO approvals (plan_id, trust_root_version, crl_snapshot_version,"
+            " cert_fingerprints, verdict_json, superseded, created_at)"
+            " VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (plan_id, ev["trust_root_version"], ev["crl_snapshot_version"],
+             json.dumps(fps), ev["result_json"], ts),
         )
         conn.execute(
             "UPDATE plans SET status = 'approved', updated_at = ? WHERE id = ?",
@@ -618,6 +883,7 @@ def list_evaluations(plan_id: int) -> list[dict]:
             "id": r["id"],
             "plan_id": r["plan_id"],
             "trust_root_version": r["trust_root_version"],
+            "crl_snapshot_version": r["crl_snapshot_version"],
             "has_gaps": bool(r["has_gaps"]),
             "result": json.loads(r["result_json"]),
             "created_at": r["created_at"],

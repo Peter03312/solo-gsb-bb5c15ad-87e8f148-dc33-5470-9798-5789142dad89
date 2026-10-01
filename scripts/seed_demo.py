@@ -3,6 +3,9 @@
 - 信任根版本 demo-root-v1（自动激活）
 - demo.example.com：现用 + 拟启用证书，窗口首尾相接，无断档 → 计划创建并批准
 - demo-gap.example.com：两窗口之间留有 14 天断档 → 计划保持 pending，演示断档报告
+- demo-crl.example.com：绑定 CRL 快照 demo-crl-v1（无撤销）的计划 → 无断档并批准；
+  另导入撤销了拟启用证书的快照 demo-crl-v2，演示快照切换 → 待复核 → 断档；
+  同时在数据库目录写入 demo-crl-v3.pem（撤销现用证书），供 demo.sh 演示导入
 
 幂等：若 demo-root-v1 已存在则跳过。
 """
@@ -122,6 +125,29 @@ def pem(cert) -> str:
     return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
 
+def make_crl(ca_cert, ca_key, this_update: datetime, next_update: datetime,
+             revoked=()):
+    """离线签发 CRL。revoked: [(serial_number, revocation_date), ...]"""
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(ca_cert.subject)
+        .last_update(this_update)
+        .next_update(next_update)
+    )
+    for serial, rev_at in revoked:
+        builder = builder.add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(serial)
+            .revocation_date(rev_at)
+            .build()
+        )
+    return builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+
+
+def crl_pem(crl) -> str:
+    return crl.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+
 def t(s: str) -> datetime:
     return datetime.fromisoformat(s).replace(tzinfo=UTC)
 
@@ -180,6 +206,52 @@ def main() -> None:
             print(f"[seed] {domain}: plan #{plan_id} approved")
         else:
             print(f"[seed] {domain}: plan #{plan_id} left pending (gaps exist)")
+
+    # ---- CRL 撤销快照演示：demo-crl.example.com ----
+    crl_domain = "demo-crl.example.com"
+    cur_cert, _ = make_leaf(root, root_key, crl_domain, t("2026-01-01"), t("2026-08-01"))
+    plan_cert, _ = make_leaf(root, root_key, crl_domain, t("2026-06-01"), t("2027-02-01"))
+    cur_fp = service.import_certificate(pem(cur_cert), f"{crl_domain}-current")[
+        "fingerprint_sha256"
+    ]
+    plan_fp = service.import_certificate(pem(plan_cert), f"{crl_domain}-planned")[
+        "fingerprint_sha256"
+    ]
+    service.create_window(crl_domain, cur_fp, "current", t("2026-01-01"), t("2026-07-01"))
+    service.create_window(crl_domain, plan_fp, "planned", t("2026-07-01"), t("2027-01-01"))
+
+    crl_v1 = make_crl(root, root_key, t("2026-01-01"), t("2027-01-01"))
+    crl_v2 = make_crl(
+        root, root_key, t("2026-01-01"), t("2027-01-01"),
+        revoked=[(plan_cert.serial_number, t("2026-09-01"))],
+    )
+    crl_v3 = make_crl(
+        root, root_key, t("2026-01-01"), t("2027-01-01"),
+        revoked=[(cur_cert.serial_number, t("2026-03-01"))],
+    )
+    service.import_crl_snapshot("demo-crl-v1", crl_pem(crl_v1))
+    service.import_crl_snapshot("demo-crl-v2", crl_pem(crl_v2))
+    print("[seed] CRL snapshots 'demo-crl-v1' (clean) and 'demo-crl-v2'"
+          " (revokes planned cert effective 2026-09-01) imported")
+
+    created = service.create_plan(
+        crl_domain, t("2026-01-01"), t("2027-01-01"), None, "demo-crl-v1"
+    )
+    plan_id = created["plan"]["id"]
+    if not created["evaluation"]["has_gaps"]:
+        service.approve_plan(plan_id)
+        print(f"[seed] {crl_domain}: plan #{plan_id} approved"
+              " (bound to CRL snapshot demo-crl-v1)")
+
+    # 供 scripts/demo.sh 演示“导入新快照”的离线 CRL 文件（与数据库同目录）
+    data_dir = os.path.dirname(os.path.abspath(db.DB_PATH))
+    for version, crl in (("demo-crl-v1", crl_v1), ("demo-crl-v2", crl_v2),
+                         ("demo-crl-v3", crl_v3)):
+        path = os.path.join(data_dir, f"{version}.pem")
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write(crl_pem(crl))
+    print(f"[seed] demo CRL PEM files written to {data_dir}"
+          " (demo-crl-v3 revokes the current cert effective 2026-03-01)")
 
     print("[seed] done")
 

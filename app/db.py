@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS plans (
     eval_start          TEXT NOT NULL,
     eval_end            TEXT NOT NULL,
     trust_root_version  TEXT NOT NULL,
+    crl_snapshot_version TEXT,                          -- 可选：绑定的 CRL 快照版本
     status              TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'pending_review')),
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     plan_id             INTEGER NOT NULL REFERENCES plans(id),
     trust_root_version  TEXT NOT NULL,
+    crl_snapshot_version TEXT,                          -- 本次评估使用的 CRL 快照（可空）
     has_gaps            INTEGER NOT NULL,
     result_json         TEXT NOT NULL,
     created_at          TEXT NOT NULL
@@ -67,13 +69,35 @@ CREATE TABLE IF NOT EXISTS approvals (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     plan_id             INTEGER NOT NULL REFERENCES plans(id),
     trust_root_version  TEXT NOT NULL,
+    crl_snapshot_version TEXT,                          -- 批准时冻结的 CRL 快照（可空）
     cert_fingerprints   TEXT NOT NULL,          -- JSON 数组，批准时冻结
     verdict_json        TEXT NOT NULL,          -- 批准时冻结的判定结果
     superseded          INTEGER NOT NULL DEFAULT 0,
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_plan ON approvals(plan_id);
+
+CREATE TABLE IF NOT EXISTS crl_snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     TEXT NOT NULL UNIQUE,
+    pem         TEXT NOT NULL,                  -- 一组 PEM CRL（每个签发者至多一条）
+    crl_count   INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
 """
+
+# 旧版本数据库的列迁移：(表, 列, 列定义)
+_MIGRATIONS = [
+    ("plans", "crl_snapshot_version", "TEXT"),
+    ("evaluations", "crl_snapshot_version", "TEXT"),
+    ("approvals", "crl_snapshot_version", "TEXT"),
+]
+
+
+def _ensure_column(conn, table: str, column: str, definition: str) -> None:
+    cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def init_db() -> None:
@@ -81,6 +105,8 @@ def init_db() -> None:
     os.makedirs(directory, exist_ok=True)
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        for table, column, definition in _MIGRATIONS:
+            _ensure_column(conn, table, column, definition)
 
 
 @contextlib.contextmanager

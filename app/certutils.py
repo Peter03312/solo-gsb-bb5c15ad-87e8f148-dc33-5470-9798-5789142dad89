@@ -45,6 +45,45 @@ def parse_pem_chain(pem: str) -> list[x509.Certificate]:
     return certs
 
 
+_PEM_CRL_BLOCK_RE = re.compile(
+    r"-----BEGIN X509 CRL-----.*?-----END X509 CRL-----", re.DOTALL
+)
+
+
+def parse_pem_crls(pem: str) -> list[x509.CertificateRevocationList]:
+    """解析一段包含一个或多个 PEM CRL 的文本。
+
+    与证书解析同样的严格模式：CRL 块之外存在任何非空白内容即视为格式错误。
+    """
+    if not isinstance(pem, str) or not pem.strip():
+        raise PemParseError("empty PEM payload")
+    blocks = _PEM_CRL_BLOCK_RE.findall(pem)
+    if not blocks:
+        raise PemParseError("no PEM CRL block found")
+    remainder = _PEM_CRL_BLOCK_RE.sub("", pem)
+    if remainder.strip():
+        raise PemParseError("unexpected data outside PEM CRL blocks")
+    crls: list[x509.CertificateRevocationList] = []
+    for i, block in enumerate(blocks, start=1):
+        try:
+            crls.append(x509.load_pem_x509_crl(block.encode("ascii")))
+        except Exception as exc:  # cryptography 抛出的各类解析异常统一收敛
+            raise PemParseError(f"CRL block #{i} is malformed: {exc}") from exc
+    return crls
+
+
+def verify_crl_signature(
+    crl: x509.CertificateRevocationList, issuer_cert: x509.Certificate
+) -> bool:
+    """用签发者证书的公钥验证 CRL 签名；签发者名称不匹配或验签失败返回 False。"""
+    if crl.issuer != issuer_cert.subject:
+        return False
+    try:
+        return crl.is_signature_valid(issuer_cert.public_key())
+    except Exception:  # 不支持的签名算法等按验证失败处理
+        return False
+
+
 def to_pem(cert: x509.Certificate) -> str:
     return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
 

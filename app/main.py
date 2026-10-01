@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .models import (
     CertificateImport,
+    CrlSnapshotImport,
     EvaluateRequest,
     PlanCreate,
     ServiceWindowCreate,
@@ -73,6 +74,30 @@ def activate_trust_root(version: str):
     return service.activate_trust_root(version)
 
 
+# ----------------------------- CRL 撤销快照 -----------------------------
+
+@app.post(f"{API}/crl-snapshots", status_code=201, tags=["crl-snapshots"])
+def import_crl_snapshot(body: CrlSnapshotImport):
+    """导入一个版本的离线 CRL 撤销快照（PEM，可含多张 CRL，每个签发者至多一条）。
+
+    每条 CRL 须由已知 CA（任一信任根版本或已导入证书链中的 CA）签署，
+    且带 nextUpdate。快照不可变：版本重复返回 409，同一签发者冲突返回 409，
+    无法解析或验签失败返回 400。
+    """
+    return service.import_crl_snapshot(body.version, body.pem)
+
+
+@app.get(f"{API}/crl-snapshots", tags=["crl-snapshots"])
+def list_crl_snapshots():
+    return {"items": service.list_crl_snapshots()}
+
+
+@app.get(f"{API}/crl-snapshots/{{version}}", tags=["crl-snapshots"])
+def get_crl_snapshot(version: str):
+    """快照详情：每条 CRL 的签发者、[thisUpdate, nextUpdate) 与撤销条目数。"""
+    return service.get_crl_snapshot(version)
+
+
 # ----------------------------- 证书 -----------------------------
 
 @app.post(f"{API}/certificates", status_code=201, tags=["certificates"])
@@ -124,9 +149,13 @@ def delete_service_window(window_id: int):
 def create_plan(body: PlanCreate):
     """创建换发计划并立即评估：评估区间内每一时刻至少一张证书
     处于服务窗口且通过 X.509 校验。返回全部断档区间与各证书不可用原因。
+
+    可选 crl_snapshot_version：选择后每次评估还要求链上每张非根证书
+    都被其签发者的 CRL 覆盖且未被撤销。
     """
     return service.create_plan(
-        body.domain, body.eval_start, body.eval_end, body.trust_root_version
+        body.domain, body.eval_start, body.eval_end, body.trust_root_version,
+        body.crl_snapshot_version,
     )
 
 
@@ -145,14 +174,19 @@ def get_plan(plan_id: int):
 
 @app.post(f"{API}/plans/{{plan_id}}/evaluate", tags=["plans"])
 def evaluate_plan(plan_id: int, body: EvaluateRequest | None = None):
-    """重新评估计划，可指定切换信任根版本。"""
+    """重新评估计划，可切换信任根版本或 CRL 快照版本。
+
+    切换快照会改变判定依据：已批准计划先转为待复核（历史批准置为被取代），
+    历史评估与冻结批准各自保留当时的快照版本与判定。
+    """
     version = body.trust_root_version if body else None
-    return service.evaluate_plan(plan_id, version)
+    snapshot = body.crl_snapshot_version if body else None
+    return service.evaluate_plan(plan_id, version, snapshot)
 
 
 @app.post(f"{API}/plans/{{plan_id}}/approve", tags=["plans"])
 def approve_plan(plan_id: int):
-    """批准计划（仅无断档）。批准时冻结证书指纹、信任根版本与判定。"""
+    """批准计划（仅无断档）。批准时冻结证书指纹、信任根版本、CRL 快照版本与判定。"""
     return service.approve_plan(plan_id)
 
 

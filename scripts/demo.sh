@@ -61,4 +61,44 @@ curl -s -X POST "$BASE/plans/1/approve" | python3 -c "import json,sys;d=json.loa
 echo "==> 10. 批准历史（历史判定全部保留）"
 curl -s "$BASE/plans/1/approvals" | $JQ
 
+echo "==> 11. CRL 撤销快照：列表与详情（种子数据已导入 demo-crl-v1 / demo-crl-v2）"
+curl -s "$BASE/crl-snapshots" | $JQ
+curl -s "$BASE/crl-snapshots/demo-crl-v2" | $JQ
+
+echo "==> 12. 计划 #3 已绑定干净快照 demo-crl-v1 并批准；切换到撤销快照 demo-crl-v2"
+echo "    （拟启用证书 2026-09-01 起被撤销 → 断档，已批准计划先转待复核）"
+curl -s -X POST "$BASE/plans/3/evaluate" -H 'Content-Type: application/json' \
+  -d '{"crl_snapshot_version": "demo-crl-v2"}' | $JQ
+curl -s "$BASE/plans/3" | python3 -c "import json,sys;d=json.load(sys.stdin);print('plan 3 status =', d['status'], '| snapshot =', d['crl_snapshot_version'])"
+echo "-- 有断档，批准应 409"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/plans/3/approve"
+
+echo "==> 13. 导入新快照 demo-crl-v3（种子离线签发的 PEM CRL，撤销现用证书）"
+CRL_FILE="${DEMO_CRL_FILE:-./data/demo-crl-v3.pem}"
+if [ -f "$CRL_FILE" ]; then
+  python3 -c "import json,sys;print(json.dumps({'version':'demo-crl-v3','pem':open(sys.argv[1]).read()}))" "$CRL_FILE" \
+    | curl -s -X POST "$BASE/crl-snapshots" -H 'Content-Type: application/json' -d @- | $JQ
+  echo "-- 切换到 demo-crl-v3：现用证书 2026-03-01 起被撤销 → 断档 [2026-03-01, 2026-07-01)"
+  curl -s -X POST "$BASE/plans/3/evaluate" -H 'Content-Type: application/json' \
+    -d '{"crl_snapshot_version": "demo-crl-v3"}' \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print('has_gaps =', d['has_gaps'], '| gaps =', d['gaps'])"
+else
+  echo "    (未找到 $CRL_FILE，跳过导入演示；本地运行时由 seed 写入 ./data/)"
+fi
+
+echo "==> 14. 切回干净快照 demo-crl-v1 → 无断档 → 重新批准"
+curl -s -X POST "$BASE/plans/3/evaluate" -H 'Content-Type: application/json' \
+  -d '{"crl_snapshot_version": "demo-crl-v1"}' | python3 -c "import json,sys;print('has_gaps =', json.load(sys.stdin)['has_gaps'])"
+curl -s -X POST "$BASE/plans/3/approve" | python3 -c "import json,sys;d=json.load(sys.stdin);print('re-approved, status =', d['plan']['status'], '| snapshot =', d['approval']['crl_snapshot_version'])"
+
+echo "==> 15. 评估与批准历史（各自保留快照版本与判定）"
+curl -s "$BASE/plans/3/evaluations" | python3 -c "import json,sys;[print(' eval', e['id'], e['crl_snapshot_version'], 'has_gaps =', e['has_gaps']) for e in json.load(sys.stdin)['items']]"
+curl -s "$BASE/plans/3/approvals" | python3 -c "import json,sys;[print(' approval', a['id'], a['crl_snapshot_version'], 'superseded =', a['superseded']) for a in json.load(sys.stdin)['items']]"
+
+echo "==> 16. 错误处理：未知快照（应 404）/ 非法 CRL（应 400）"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/plans" -H 'Content-Type: application/json' \
+  -d '{"domain":"demo.example.com","eval_start":"2026-01-01T00:00:00Z","eval_end":"2027-01-01T00:00:00Z","crl_snapshot_version":"no-such-snapshot"}'
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/crl-snapshots" \
+  -H 'Content-Type: application/json' -d '{"version":"bad-crl","pem":"not-a-crl"}'
+
 echo "demo done."

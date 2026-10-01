@@ -95,6 +95,31 @@ def pem(*certs) -> str:
     )
 
 
+def make_crl(issuer_cert, issuer_key, this_update="2026-01-01", next_update="2027-01-01",
+             revoked=()):
+    """离线签发一张 CRL。revoked: [(serial_number, revocation_date_str), ...]"""
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(issuer_cert.subject)
+        .last_update(t(this_update))
+        .next_update(t(next_update))
+    )
+    for serial, rev_at in revoked:
+        builder = builder.add_revoked_certificate(
+            x509.RevokedCertificateBuilder()
+            .serial_number(serial)
+            .revocation_date(t(rev_at))
+            .build()
+        )
+    return builder.sign(private_key=issuer_key, algorithm=hashes.SHA256())
+
+
+def crl_pem(*crls) -> str:
+    return "".join(
+        c.public_bytes(serialization.Encoding.PEM).decode("ascii") for c in crls
+    )
+
+
 def fingerprint(pem_str: str) -> str:
     import hashlib
     import re
