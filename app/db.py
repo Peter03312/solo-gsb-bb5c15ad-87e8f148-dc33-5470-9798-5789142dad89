@@ -73,7 +73,46 @@ CREATE TABLE IF NOT EXISTS approvals (
     created_at          TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_plan ON approvals(plan_id);
+
+-- 离线撤销快照：不可变的带版本 PEM CRL 集合
+CREATE TABLE IF NOT EXISTS crl_snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    version     TEXT NOT NULL UNIQUE,
+    pem         TEXT NOT NULL,                  -- 原始 PEM bundle
+    crl_count   INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS crl_entries (
+    id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id              INTEGER NOT NULL REFERENCES crl_snapshots(id),
+    issuer_dn                TEXT NOT NULL,     -- CRL issuer 标识名
+    issuer_key_id            TEXT NOT NULL,     -- AKI hex；无 AKI 时为空串
+    crl_number               INTEGER,           -- 无 cRLNumber 扩展时为 NULL
+    this_update              TEXT NOT NULL,
+    next_update              TEXT NOT NULL,
+    revoked_count            INTEGER NOT NULL DEFAULT 0,
+    pem                      TEXT NOT NULL       -- 单个 CRL 的 PEM
+);
+CREATE INDEX IF NOT EXISTS idx_crl_entries_snapshot ON crl_entries(snapshot_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_crl_entries_issuer
+    ON crl_entries(snapshot_id, issuer_dn, issuer_key_id);
 """
+
+# 既有库的轻量迁移：计划/评估/批准各增加撤销快照版本列（NULL = 未选择快照，
+# 保持原评估与响应语义）。
+_COLUMN_MIGRATIONS = (
+    ("plans", "crl_snapshot_version", "TEXT"),
+    ("evaluations", "crl_snapshot_version", "TEXT"),
+    ("approvals", "crl_snapshot_version", "TEXT"),
+)
+
+
+def _migrate(conn) -> None:
+    for table, column, decl in _COLUMN_MIGRATIONS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def init_db() -> None:
@@ -81,6 +120,7 @@ def init_db() -> None:
     os.makedirs(directory, exist_ok=True)
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
 
 
 @contextlib.contextmanager

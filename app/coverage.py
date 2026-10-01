@@ -29,3 +29,22 @@ def compute_gaps(
     if cursor < eval_end:
         gaps.append((cursor, eval_end))
     return gaps
+
+
+def intersect(
+    a: list[tuple[datetime, datetime]],
+    b: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    """两个半开区间列表的逐对交集（端点相接产生空区间，自动丢弃）。"""
+    out: list[tuple[datetime, datetime]] = []
+    i = j = 0
+    a, b = sorted(a), sorted(b)
+    while i < len(a) and j < len(b):
+        s, e = max(a[i][0], b[j][0]), min(a[i][1], b[j][1])
+        if s < e:
+            out.append((s, e))
+        if a[i][1] <= b[j][1]:
+            i += 1
+        else:
+            j += 1
+    return out

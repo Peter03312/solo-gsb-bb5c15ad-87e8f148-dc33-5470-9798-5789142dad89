@@ -118,6 +118,40 @@ def make_leaf(ca_cert, ca_key, domain: str, nb: datetime, na: datetime):
     return cert, key
 
 
+def make_crl(root_cert, root_key, last_update: str, next_update: str,
+             revoked=None, number=None):
+    """构造一张由根 CA 离线签发的 PEM CRL。
+
+    revoked: [(serial:int, revocation_date:str, reason|None), ...]
+    """
+    builder = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(root_cert.subject)
+        .last_update(t(last_update))
+        .next_update(t(next_update))
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()),
+            critical=False,
+        )
+    )
+    if number is not None:
+        builder = builder.add_extension(x509.CRLNumber(number), critical=False)
+    for serial, rev_date, reason in revoked or []:
+        rc = (
+            x509.RevokedCertificateBuilder()
+            .serial_number(serial)
+            .revocation_date(t(rev_date))
+        )
+        if reason is not None:
+            rc = rc.add_extension(x509.CRLReason(reason), critical=False)
+        builder = builder.add_revoked_certificate(rc.build())
+    return (
+        builder.sign(root_key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.PEM)
+        .decode("ascii")
+    )
+
+
 def pem(cert) -> str:
     return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
 
@@ -157,9 +191,11 @@ def main() -> None:
         ),
     ]
 
+    current_serials: dict[str, int] = {}
     for domain, cur_win, plan_win, cur_val, plan_val in scenarios:
         cur_cert, _ = make_leaf(root, root_key, domain, t(cur_val[0]), t(cur_val[1]))
         plan_cert, _ = make_leaf(root, root_key, domain, t(plan_val[0]), t(plan_val[1]))
+        current_serials[domain] = cur_cert.serial_number
         cur_fp = service.import_certificate(pem(cur_cert), f"{domain}-current")[
             "fingerprint_sha256"
         ]
@@ -180,6 +216,35 @@ def main() -> None:
             print(f"[seed] {domain}: plan #{plan_id} approved")
         else:
             print(f"[seed] {domain}: plan #{plan_id} left pending (gaps exist)")
+
+    # 两个不可变的离线撤销快照（默认不绑定任何计划，仅供演示选用）：
+    # - demo-crl-2026Q1：CRL 覆盖整个评估区间且无撤销 → 选用后仍无断档
+    # - demo-crl-2026Q1-revoked：撤销 demo.example.com 现用证书（2026-03-01 生效）
+    #   → 选用后 2026-03-01 起断档
+    good_crl = make_crl(root, root_key, "2025-12-01", "2027-02-01", revoked=[],
+                        number=1)
+    service.import_crl_snapshot("demo-crl-2026Q1", good_crl)
+    print("[seed] CRL snapshot 'demo-crl-2026Q1' imported (no revocations)")
+
+    revoked_crl = make_crl(
+        root,
+        root_key,
+        "2025-12-01",
+        "2027-02-01",
+        revoked=[
+            (
+                current_serials["demo.example.com"],
+                "2026-03-01",
+                x509.ReasonFlags.key_compromise,
+            )
+        ],
+        number=2,
+    )
+    service.import_crl_snapshot("demo-crl-2026Q1-revoked", revoked_crl)
+    print(
+        "[seed] CRL snapshot 'demo-crl-2026Q1-revoked' imported"
+        " (revokes demo.example.com current cert at 2026-03-01)"
+    )
 
     print("[seed] done")
 

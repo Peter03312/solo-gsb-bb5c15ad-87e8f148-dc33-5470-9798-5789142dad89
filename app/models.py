@@ -27,6 +27,11 @@ class TrustRootImport(BaseModel):
     pem: str = Field(min_length=1)
 
 
+class CrlSnapshotImport(BaseModel):
+    version: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+    pem: str = Field(min_length=1)
+
+
 class CertificateImport(BaseModel):
     pem: str = Field(min_length=1)
     label: Optional[str] = Field(default=None, max_length=128)
@@ -48,6 +53,7 @@ class PlanCreate(BaseModel):
     eval_start: datetime
     eval_end: datetime
     trust_root_version: Optional[str] = Field(default=None, max_length=64)
+    crl_snapshot_version: Optional[str] = Field(default=None, max_length=64)
 
     _tz = field_validator("eval_start", "eval_end")(_require_tz_utc)
     _dom = field_validator("domain")(_norm_domain)
@@ -55,3 +61,6 @@ class PlanCreate(BaseModel):
 
 class EvaluateRequest(BaseModel):
     trust_root_version: Optional[str] = Field(default=None, max_length=64)
+    # 省略 → 沿用计划当前选择；显式 null → 取消快照、回到无快照语义；
+    # 未知快照版本 → 404（不得静默按安全处理）。
+    crl_snapshot_version: Optional[str] = Field(default=None, max_length=64)

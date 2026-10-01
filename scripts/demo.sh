@@ -61,4 +61,48 @@ curl -s -X POST "$BASE/plans/1/approve" | python3 -c "import json,sys;d=json.loa
 echo "==> 10. 批准历史（历史判定全部保留）"
 curl -s "$BASE/plans/1/approvals" | $JQ
 
+echo "==> 11. 离线撤销快照（CRL）"
+echo "-- 11.1 列出快照（种子数据导入了 demo-crl-2026Q1 / -revoked）"
+curl -s "$BASE/crl-snapshots" | $JQ
+curl -s "$BASE/crl-snapshots/demo-crl-2026Q1-revoked" | $JQ
+
+echo "-- 11.2 选择无撤销快照创建计划（CRL 覆盖整个评估区间 → 无断档）"
+CRL_PLAN=$(curl -s -X POST "$BASE/plans" -H 'Content-Type: application/json' -d '{
+  "domain": "demo.example.com",
+  "eval_start": "2026-01-01T00:00:00Z",
+  "eval_end":   "2027-01-01T00:00:00Z",
+  "crl_snapshot_version": "demo-crl-2026Q1"
+}')
+echo "$CRL_PLAN" | $JQ
+CPID=$(echo "$CRL_PLAN" | python3 -c "import json,sys;print(json.load(sys.stdin)['plan']['id'])")
+
+echo "-- 11.3 重评切换到含撤销的快照（现用证书 2026-03-01 起撤销 → 出现断档，逐证书原因）"
+curl -s -X POST "$BASE/plans/$CPID/evaluate" -H 'Content-Type: application/json' \
+  -d '{"crl_snapshot_version":"demo-crl-2026Q1-revoked"}' \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('has_gaps =', d['has_gaps']);print('gaps =', d['gaps']);print('reasons =', d['certificates'][0]['reasons'])"
+
+echo "-- 11.4 切回无撤销快照（可重新批准；历史评估与冻结批准各自保留快照版本）"
+curl -s -X POST "$BASE/plans/$CPID/evaluate" -H 'Content-Type: application/json' \
+  -d '{"crl_snapshot_version":"demo-crl-2026Q1"}' >/dev/null
+curl -s -X POST "$BASE/plans/$CPID/approve" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print('approved, snapshot =', d['approval']['crl_snapshot_version'])"
+curl -s "$BASE/plans/$CPID/evaluations" \
+  | python3 -c "import json,sys;print('evaluation snapshots =', [e['crl_snapshot_version'] for e in json.load(sys.stdin)['items']])"
+
+echo "-- 11.5 非法 CRL（400）与重复快照版本（409）被拒"
+curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/crl-snapshots" \
+  -H 'Content-Type: application/json' -d '{"version":"bad","pem":"not-a-crl"}'
+GOOD_PEM=$(curl -s "$BASE/crl-snapshots/demo-crl-2026Q1" >/dev/null; \
+  python3 - <<'PYEOF'
+import json, os, sqlite3
+conn = sqlite3.connect(os.environ.get("TLS_CHECKER_DB", "/data/tls_checker.db"))
+pem = conn.execute(
+    "SELECT pem FROM crl_snapshots WHERE version='demo-crl-2026Q1'"
+).fetchone()[0]
+print(json.dumps({"version": "demo-crl-2026Q1", "pem": pem}))
+PYEOF
+)
+printf '%s' "$GOOD_PEM" | curl -s -w "\nHTTP %{http_code}\n" -X POST "$BASE/crl-snapshots" \
+  -H 'Content-Type: application/json' -d @-
+
 echo "demo done."

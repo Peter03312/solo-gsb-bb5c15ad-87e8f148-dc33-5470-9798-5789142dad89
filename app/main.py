@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .models import (
     CertificateImport,
+    CrlSnapshotImport,
     EvaluateRequest,
     PlanCreate,
     ServiceWindowCreate,
@@ -73,6 +74,30 @@ def activate_trust_root(version: str):
     return service.activate_trust_root(version)
 
 
+# ----------------------------- 离线撤销快照（CRL） -----------------------------
+
+@app.post(f"{API}/crl-snapshots", status_code=201, tags=["crl-snapshots"])
+def import_crl_snapshot(body: CrlSnapshotImport):
+    """导入带版本的一组 PEM CRL（不可变离线撤销快照）。
+
+    服务逐张验证签名（须由已导入的 CA 证书签署且 cRLSign），并拒绝：
+    重复版本（409）、同一签发者的冲突/重复列表（409）、
+    无法解析或内容非法（400）、未知签发者（400）。
+    """
+    return service.import_crl_snapshot(body.version, body.pem)
+
+
+@app.get(f"{API}/crl-snapshots", tags=["crl-snapshots"])
+def list_crl_snapshots():
+    return {"items": service.list_crl_snapshots()}
+
+
+@app.get(f"{API}/crl-snapshots/{{version}}", tags=["crl-snapshots"])
+def get_crl_snapshot(version: str):
+    """查询快照详情（逐签发者的 thisUpdate/nextUpdate/撤销条数）。"""
+    return service.get_crl_snapshot(version)
+
+
 # ----------------------------- 证书 -----------------------------
 
 @app.post(f"{API}/certificates", status_code=201, tags=["certificates"])
@@ -124,9 +149,17 @@ def delete_service_window(window_id: int):
 def create_plan(body: PlanCreate):
     """创建换发计划并立即评估：评估区间内每一时刻至少一张证书
     处于服务窗口且通过 X.509 校验。返回全部断档区间与各证书不可用原因。
+
+    可选 crl_snapshot_version：选择不可变的离线撤销快照；选择后评估还要求
+    链上每张非根证书存在签发者 CRL 证据（在 [thisUpdate,nextUpdate) 内且
+    未到撤销生效时刻），缺失/过期/已撤销时段计入断档。
     """
     return service.create_plan(
-        body.domain, body.eval_start, body.eval_end, body.trust_root_version
+        body.domain,
+        body.eval_start,
+        body.eval_end,
+        body.trust_root_version,
+        body.crl_snapshot_version,
     )
 
 
@@ -145,9 +178,19 @@ def get_plan(plan_id: int):
 
 @app.post(f"{API}/plans/{{plan_id}}/evaluate", tags=["plans"])
 def evaluate_plan(plan_id: int, body: EvaluateRequest | None = None):
-    """重新评估计划，可指定切换信任根版本。"""
-    version = body.trust_root_version if body else None
-    return service.evaluate_plan(plan_id, version)
+    """重新评估计划，可切换信任根版本与/或撤销快照。
+
+    crl_snapshot_version 省略时沿用计划当前选择；显式传 null 取消快照；
+    切换快照时已批准计划先转待复核（历史评估/批准保留）。
+    """
+    if body is None:
+        return service.evaluate_plan(plan_id, None, None, snapshot_given=False)
+    return service.evaluate_plan(
+        plan_id,
+        body.trust_root_version,
+        body.crl_snapshot_version,
+        snapshot_given="crl_snapshot_version" in body.model_fields_set,
+    )
 
 
 @app.post(f"{API}/plans/{{plan_id}}/approve", tags=["plans"])
